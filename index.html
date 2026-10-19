@@ -220,6 +220,7 @@ body.clean .hud,body.clean .console,body.clean .hint{display:none}
     <div class="pane" data-pane="ph" hidden>
       <p class="note">「自動」會依天氣、時間和水域條件自然出現；「開」強制顯示（仍需符合基本幾何，例如彩虹要太陽在背後）；「關」不出現。綠點越亮表示目前越明顯。</p>
       <div id="ph-list" class="pane"></div>
+      <div class="toggle-row"><span>星座連線</span><button class="switch" id="const-lines" role="switch" aria-checked="false" aria-label="星座連線"></button></div>
       <div class="toggle-row"><span>漁船巡航（拖出克耳文船跡）</span><button class="switch" id="cruise" role="switch" aria-checked="true" aria-label="漁船巡航"></button></div>
     </div>
     <div class="pane" data-pane="hz" hidden>
@@ -269,7 +270,7 @@ const isMobile = matchMedia('(max-width: 760px)').matches || /Mobi|Android/i.tes
 const WATERS_KEYS=['ocean','tropic','polar','coast','lake'];
 const DEFAULTS = {time:17.6, wind:8, windDir:250, cloud:.3, precip:0, temp:24, fog:.22, thunder:0,
   water:'ocean', waveScale:1, chop:.6, foam:.6, clarity:.6,
-  timeRate:600, moon:.5, showBoats:true, showBuoys:true, cruise:true, rogueAuto:false, diveDepth:8, ph:{rays:0,rainbow:0,green:0,mirage:0,halo:0,aurora:0,bio:0,spray:0,ripple:0}, tsuH:22, quakeM:8.2, whirlS:.8, tyWind:45, timeFlow:false, quakeTsu:true, quality: isMobile ? 0 : 1};
+  timeRate:600, moon:.5, constLines:false, showBoats:true, showBuoys:true, cruise:true, rogueAuto:false, diveDepth:8, ph:{rays:0,rainbow:0,green:0,mirage:0,halo:0,aurora:0,bio:0,spray:0,ripple:0}, tsuH:22, quakeM:8.2, whirlS:.8, tyWind:45, timeFlow:false, quakeTsu:true, quality: isMobile ? 0 : 1};
 let S = Object.assign({}, DEFAULTS);
 try{ const raw = localStorage.getItem('oceansim.v2'); if(raw){ const o=JSON.parse(raw); Object.assign(S, o); S.ph=Object.assign({}, DEFAULTS.ph, o.ph||{}); } }catch(e){}
 if(!WATERS_KEYS.includes(S.water)) S.water='ocean';
@@ -398,7 +399,9 @@ uniform vec3 uDeep; uniform vec3 uShallow; uniform float uFoam; uniform float uC
 uniform vec3 uAbsorb; uniform float uBedDepth; uniform int uBed; uniform int uLand; uniform float uIce; uniform float uSmoke;
 uniform float uRays; uniform float uRainbow; uniform float uGreen; uniform float uMirage; uniform float uHalo; uniform float uAurora;
 uniform float uBio; uniform float uSpray; uniform float uRipple; uniform float uBeam; uniform float uUnder; uniform vec3 uAurSeed;
-uniform sampler2D uMoonTex; uniform float uMoonTexOn; uniform sampler2D uBgTex0; uniform sampler2D uBgTex1; uniform vec4 uBg0; uniform vec4 uBg1; uniform vec2 uBgEl; uniform vec2 uBgOn; uniform vec2 uBgLights;
+uniform sampler2D uMoonTex; uniform float uMoonTexOn;
+uniform sampler2D uStarTex; uniform sampler2D uMilkyTex; uniform sampler2D uLineTex; uniform float uSkyTexOn; uniform float uLines;
+uniform vec3 uCelP; uniform vec3 uCelM; uniform vec3 uCelE; uniform float uLST; uniform sampler2D uBgTex0; uniform sampler2D uBgTex1; uniform vec4 uBg0; uniform vec4 uBg1; uniform vec2 uBgEl; uniform vec2 uBgOn; uniform vec2 uBgLights;
 ${TONEMAP}
 const float PI = 3.14159265;
 float hash(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
@@ -783,7 +786,33 @@ vec3 skyView(vec3 rd, bool direct, int oct){
     }
     // stars, washed out by moonlight, twilight, haze and cloud
     float sv = uNight*(1.0 - 0.85*moonGlow)*(1.0 - uFogAmt)*smoothstep(0.0,0.2,rd.y);
-    if(sv > 0.0){
+    if(sv > 0.0 && uSkyTexOn > 0.5){
+      // real sky: equatorial star maps turned by latitude and local sidereal time
+      float dec = asin(clamp(dot(rd, uCelP), -1.0, 1.0));
+      float H = atan(-dot(rd, uCelE), dot(rd, uCelM));
+      vec2 uv = vec2(fract(0.5 - (uLST - H)/6.2831853), 0.5 - dec/3.14159265);
+      vec3 mw = pow(textureLod(uMilkyTex, uv, 0.0).rgb, vec3(2.2));
+      c += max(mw - 0.02, 0.0)*0.022*sv*(1.0 - 0.7*moonGlow);
+      vec2 res = vec2(textureSize(uStarTex, 0));
+      vec2 tc = uv*res - 0.5; vec2 b = floor(tc);
+      float cosd = max(cos(dec), 0.05);
+      float sig = max(uPix*0.8, 0.0005);
+      vec3 st = vec3(0.0);
+      for(int j=0;j<2;j++) for(int i=0;i<2;i++){
+        vec2 cell = b + vec2(float(i), float(j));
+        ivec2 ic = ivec2(int(mod(cell.x, res.x)), int(clamp(cell.y, 0.0, res.y - 1.0)));
+        vec3 sc = texelFetch(uStarTex, ic, 0).rgb;
+        float lum = max(sc.r, max(sc.g, sc.b));
+        if(lum < 0.035) continue;
+        vec2 dd = tc - cell;
+        vec2 ang = vec2(dd.x/res.x*6.2831853*cosd, dd.y/res.y*3.14159265);
+        float vis = smoothstep(moonGlow*0.3, moonGlow*0.3 + 0.12, lum);       // moonlight drowns the faint ones first
+        float tw = 0.8 + 0.2*sin(uTime*(2.0 + fract(cell.x*0.37)*4.0) + cell.y*1.7);
+        st += pow(sc, vec3(2.2))*exp(-dot(ang,ang)/(2.0*sig*sig))*vis*tw;
+      }
+      c += st*0.7*sv;
+      if(uLines > 0.0) c += vec3(0.25,0.45,0.9)*textureLod(uLineTex, uv, 0.0).r*0.012*uLines*uNight*smoothstep(0.0,0.1,rd.y)*(1.0 - uFogAmt);
+    } else if(sv > 0.0){
       vec3 scell = floor(rd*420.0); float h = fract(sin(dot(scell,vec3(12.9898,78.233,37.719)))*43758.5453);
       float mag = fract(h*97.13);
       float st = step(1.0 - 0.0035 - 0.004*(1.0-moonGlow), h)*(0.25+0.75*mag*mag)*(0.7+0.3*sin(uTime*(2.0+mag*3.0)+h*90.0));
@@ -1409,9 +1438,35 @@ void main(){
 }
 #endif
 
+#ifdef MODE_FOAM
+// foam simulation: drift with the wind, fade over seconds, fed by breaking crests, wakes and hazards
+uniform sampler2D uFoamPrev; uniform sampler2D uWaveTex; uniform vec4 uCurL; uniform vec4 uPrevL; uniform vec2 uLevelRes; uniform float uDt;
+void main(){
+  vec2 uv = gl_FragCoord.xy/uLevelRes;
+  vec2 p = uCurL.xy + (uv - 0.5)*uCurL.z;
+  vec2 drift = uWindDir*(0.25 + 0.025*uWind)*uDt;
+  vec2 uvp = (p - drift - uPrevL.xy)/uPrevL.z + 0.5;
+  vec2 prev = (all(greaterThan(uvp, vec2(0.0))) && all(lessThan(uvp, vec2(1.0)))) ? texture(uFoamPrev, uvp).rg : vec2(0.0, 10.0);
+  vec4 w = textureLod(uWaveTex, uv, 0.0);
+  float cr; swell(p, 0.0, cr);
+  float dhn = w.w/(uDetail + 0.01); float slope = length(w.yz);
+  float nz = noise(p*0.035 + uWindDir*uTime*0.3)*0.65 + noise(p*0.13 - uTime*0.2)*0.35;
+  float wfac = smoothstep(4.0, 16.0, uWind);
+  float brk = smoothstep(0.42, 0.78, cr*0.75 + dhn*0.45 + slope*0.25 + nz*0.35 - 0.15 + smoothstep(12.0,30.0,uWind)*0.15)*wfac*uFoam;
+  float wf, ct; wakeH(p, wf, ct);
+  float src = clamp(brk + clamp(wf,0.0,1.0)*0.85 + disasterFoam(p, nz)*(0.55 + 0.45*nz) + ct*0.35, 0.0, 1.0);
+  float tau = mix(2.5, 8.0, smoothstep(5.0, 25.0, uWind));
+  float d = prev.x*exp(-uDt/tau);
+  float age = min(prev.y + uDt, 30.0);
+  if(src > d){ float k = clamp(uDt*7.0, 0.0, 1.0); age = mix(age, 0.0, clamp((src - d)*4.0, 0.0, 1.0)); d = mix(d, src, k); }
+  outColor = vec4(d, age, 0.0, 1.0);
+}
+#endif
+
 #ifdef MODE_SEA
 uniform sampler2D uNearTex; uniform sampler2D uFarTex; uniform sampler2D uEnvTex;
 uniform vec4 uNearL; uniform vec4 uFarL;
+uniform sampler2D uFoamTex; uniform sampler2D uLaceTex; uniform vec4 uFoamL; uniform float uFoamOn;
 float edgeW(vec2 u){ return smoothstep(0.0, 0.06, min(min(u.x,u.y), min(1.0-u.x,1.0-u.y))); }
 vec4 waveAt(vec2 p, float t, out float texel){
   vec2 un = (p - uNearL.xy)/uNearL.z + 0.5, uf = (p - uFarL.xy)/uFarL.z + 0.5;
@@ -1522,13 +1577,33 @@ vec3 shadeSeaM(vec3 ro, vec3 rd, float t, vec3 p){
   float wakeFoam = clamp(wakeF,0.0,1.0)*smoothstep(0.35,0.85,noise(p.xz*0.9 + uTime*0.5)*0.7 + wakeF*0.5)*0.75;
   float hazard = disasterFoam(p.xz, nz);
   float foam = clamp(cap + streak + wakeFoam*0.8 + hazard*(0.55+0.45*nz), 0.0, 1.0)*(1.0 - 0.5*smoothstep(600.0,3000.0,t));
+  // persistent foam: density and age carried frame to frame in the foam texture (near region)
+  float age = 10.0;
+  if(uFoamOn > 0.5){
+    vec2 uf = (p.xz - uFoamL.xy)/uFoamL.z + 0.5; float fw = edgeW(uf);
+    if(fw > 0.0){
+      vec2 fa = textureLod(uFoamTex, uf, log2(max(t*uPix/uFoamL.w, 1.0))).rg;
+      foam = mix(foam, clamp(fa.x + streak*0.5, 0.0, 1.0), fw); age = mix(10.0, fa.y, fw);
+    }
+  }
   // whitewater: bubbly, self-shadowed, translucent where thin
   float fq = noise(p.xz*0.9 + uTime*0.4)*0.5 + noise(p.xz*3.1 - uTime*0.7)*0.3 + noise(p.xz*0.23 + uTime*0.1)*0.2;
-  float cover = clamp(foam*(0.55 + 0.9*fq), 0.0, 1.0);
+  // lace: fresh foam is a solid sheet, older foam thins into a network of bubble walls
+  vec2 lp = p.xz*0.09 + uWindDir*uTime*0.012;
+  float lace = texture(uLaceTex, lp).r*0.62 + texture(uLaceTex, lp*3.1 + 0.37).r*0.38;
+  float fresh = 1.0 - smoothstep(0.5, 3.5, age);
+  float solid = smoothstep(0.18, 0.6, foam);
+  float laceCov = smoothstep(1.0 - foam*1.2, 1.0 - foam*1.2 + 0.14, lace);
+  float cover = mix(laceCov, max(solid, laceCov), fresh);
+  cover = mix(cover, foam*(0.5 + 0.4*fresh), smoothstep(0.03, 0.12, t*uPix));   // lace finer than a pixel: average it
   float fshade = mix(0.45, 1.08, smoothstep(0.2, 0.85, fq));
   vec3 foamCol = vec3(0.84,0.87,0.88)*(uSunCol*vis*max(dot(n,uLightDir),0.0)*fshade + uAmb*mix(0.65,1.0,fq))/PI;
   vec3 thinCol = foamCol*vec3(0.62,0.86,0.84) + uShallow*uClarity*uSunCol*visC*0.06/PI;
   foamCol = mix(thinCol, foamCol, smoothstep(0.25, 0.85, cover));
+  foamCol *= mix(0.8, 1.05, lace) ;
+  foamCol = mix(foamCol, foamCol*vec3(0.7,0.92,0.9) + uShallow*uClarity*uSunCol*visC*0.05/PI, fresh*0.35*(1.0 - solid));
+  float glint = smoothstep(0.985, 1.0, noise(p.xz*55.0 + uTime*vec2(2.1,-1.7)))*cover*smoothstep(0.03, 0.0, t*uPix);
+  col += uSunCol*vis*glint*0.03*max(dot(n,uLightDir),0.0);
   col = mix(col, foamCol, smoothstep(0.0, 0.9, cover));
   // spindrift in strong wind
   if(uSpray > 0.0){
@@ -1627,7 +1702,7 @@ void main(){
 }
 #endif
 
-#if !defined(MODE_WAVE) && !defined(MODE_SEA) && !defined(MODE_SKY) && !defined(MODE_VOL)
+#if !defined(MODE_WAVE) && !defined(MODE_SEA) && !defined(MODE_SKY) && !defined(MODE_VOL) && !defined(MODE_FOAM)
 void main(){
   vec3 rd = normalize(uCamRot*vec3(vNdc.x*uTanH*uAspect, vNdc.y*uTanH, -1.0));
   vec3 ro = uCamPos;
@@ -1701,7 +1776,7 @@ uniform vec4 uColor; uniform float uRound; uniform float uFogD; uniform vec3 uFo
 ${TONEMAP}
 void main(){
   float a = uColor.a;
-  if(uRound > 0.5){ vec2 c = gl_PointCoord-0.5; float r = dot(c,c); if(r > 0.25) discard; a *= 1.0 - r*3.2; }
+  if(uRound > 0.5){ vec2 c = gl_PointCoord-0.5; float r = dot(c,c); if(r > 0.25) discard; a *= exp(-r*14.0); }
   float f = exp(-vDist*uFogD);
   outColor = vec4(toneMap(mix(uFogCol, uColor.rgb, f)), a*(0.25+0.75*f));
 }`;
@@ -1818,20 +1893,21 @@ let PIPE = !!gl.getExtension('EXT_color_buffer_float') && FORCE!=='safe' && FORC
 const withDefs = (src, defs) => src.replace(/^#version 300 es\n/, '#version 300 es\n'+defs+'\n');
 const V = defs => SEA_FS.replace('__VARIANT__', defs);
 let seaLite=null, seaFull=null, objProg=null, partProg=null, SAFE=(FORCE==='safe');
-let waveProg=null, skyLite=null, skyFull=null, meshLite=null, meshFull=null, volFull=null, finalProg=null, underProg=null, underState='none';
+let foamProg=null, waveProg=null, skyLite=null, skyFull=null, meshLite=null, meshFull=null, volFull=null, finalProg=null, underProg=null, underState='none';
 let ready = false, failed = false, fullState = 'none';   // none | compiling | ready | failed
 let baseSet = [], fullSet = [];
 function startCompile(){
   if(PIPE){
     const H = '#define HDR_OUT';
     waveProg = compileStart(SEA_VS, V('#define MODE_WAVE\n'+H), 'wave');
+    foamProg = compileStart(SEA_VS, V('#define MODE_FOAM\n'+H), 'foam');
     skyLite  = compileStart(SEA_VS, V('#define MODE_SKY\n'+H), 'sky');
     meshLite = compileStart(MESH_VS, V('#define MODE_SEA\n'+H), 'sea-mesh');
     finalProg = compileStart(SEA_VS, FINAL_FS, 'final');
     objProg = compileStart(OBJ_VS, withDefs(OBJ_FS, H), 'object');
     partProg = compileStart(PART_VS, withDefs(PART_FS, H), 'particle');
     seaLite = meshLite;
-    baseSet = [waveProg, skyLite, meshLite, finalProg, objProg, partProg];
+    baseSet = [waveProg, foamProg, skyLite, meshLite, finalProg, objProg, partProg];
   } else if(SAFE){
     seaLite = compileStart(SEA_VS, MINI_FS, 'safe');
     objProg = compileStart(OBJ_VS, OBJ_FS, 'object');
@@ -2181,6 +2257,25 @@ function bgTexture(name){
     bgCache[name].tex=t; }).catch(()=>{});
   return null;
 }
+const skyTex = {stars:null, milky:null, lines:null};
+function loadSkyTex(){
+  const load=(name, key, nearest)=>fetch('models/'+name).then(r=>{ if(!r.ok) throw 0; return r.blob(); }).then(b=>createImageBitmap(b)).then(bmp=>{
+    const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,bmp);
+    if(nearest){ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST); }
+    else { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    skyTex[key]=t; }).catch(()=>{});
+  load('sky_stars.jpg','stars',true); load('sky_milkyway.jpg','milky',false); load('sky_lines.jpg','lines',false);
+}
+// celestial frame for Taiwan (about 23.5°N, 121°E): local sidereal time from the simulated date and clock
+const LAT = 23.5*Math.PI/180, LON = 121;
+const CEL_P = [0, Math.sin(LAT), -Math.cos(LAT)], CEL_M = [0, Math.cos(LAT), Math.sin(LAT)], CEL_E = [1, 0, 0];
+const J2000_BASE = (Date.UTC(2026,9,20) - Date.UTC(2000,0,1,12))/86400000;
+function localSidereal(){
+  const d = J2000_BASE + dayCount + (S.time - 8)/24;
+  const deg = 280.46061837 + 360.98564736629*d + LON;
+  return ((deg % 360) + 360) % 360 * Math.PI/180;
+}
 function loadMoon(){ fetch('models/moon.jpg').then(r=>{ if(!r.ok) throw 0; return r.blob(); }).then(b=>createImageBitmap(b)).then(bmp=>{
   const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,bmp);
   gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
@@ -2190,7 +2285,7 @@ function loadAssets(){
   for(const name of ['boat_blue','boat_rust','buoy']){
     loadModel(name).then(m=>{ MODELS[name]=m; }).catch(e=>console.warn('model', name, e.message));
   }
-  loadMoon();
+  loadMoon(); loadSkyTex();
 }
 
 function updateObjects(dt){
@@ -2308,7 +2403,9 @@ const sprP = new Float32Array(SPRAY_N*3), sprV = new Float32Array(SPRAY_N*3), sp
 const sprayG = dynBuf(SPRAY_N*3); const spray = {n:0};
 function updateSpray(dt, amt){
   const T=U.tsu; const tsA = T[3]>0 ? clamp(T[3]/10,0,1) : 0;
-  const n = Math.floor(Math.max(amt, tsA)*SPRAY_N); spray.n = n; if(!n) return;
+  const crestA = cam.under ? 0 : smooth(9, 18, C.wind)*0.5;       // small bursts where crests break
+  const n = Math.floor(Math.max(amt, tsA, crestA)*SPRAY_N); spray.n = n; if(!n) return;
+  const crestOnly = amt < 0.05 && tsA === 0;
   const [cx,,cz]=cam.eye; const [tx,tz]=windTravel(); const W=C.wind;
   const pTs = tsA/(amt+tsA+1e-6);
   for(let i=0;i<n;i++){
@@ -2320,6 +2417,14 @@ function updateSpray(dt, amt){
       const ts=tsuShapeJS(x,z); x -= T[0]*ts.d; z -= T[1]*ts.d; x += T[0]*(Math.random()*12-6); z += T[1]*(Math.random()*12-6);
       sprP[j]=x; sprP[j+1]=heightAt(x,z)+Math.random()*3; sprP[j+2]=z;
       const v=8+Math.random()*12; sprV[j]=T[0]*v+(Math.random()-.5)*4; sprV[j+1]=4+Math.random()*10; sprV[j+2]=T[1]*v+(Math.random()-.5)*4; sprL[i]=1+Math.random()*2.5;
+    } else if(sprL[i]<=0 && crestOnly){
+      // look for a crest near the camera; flick a little spray off it downwind
+      const ang=Math.random()*TAU, r=10+Math.random()*80; const x=cx+Math.cos(ang)*r, z=cz+Math.sin(ang)*r;
+      const h = heightAt(x,z);
+      if(h > seaInfo.hs*0.32 && Math.random() < .5){
+        sprP[j]=x; sprP[j+1]=h+.2; sprP[j+2]=z;
+        sprV[j]=tx*W*(.25+Math.random()*.3)+(Math.random()-.5); sprV[j+1]=1.2+Math.random()*2.2; sprV[j+2]=tz*W*(.25+Math.random()*.3)+(Math.random()-.5); sprL[i]=.5+Math.random()*.9;
+      } else { sprP[j+1]=-50; sprL[i]=.05; }
     } else if(sprL[i]<=0){
       const ang=Math.random()*TAU, r=8+Math.random()*90; const x=cx+Math.cos(ang)*r, z=cz+Math.sin(ang)*r;
       sprP[j]=x; sprP[j+1]=heightAt(x,z)+.3; sprP[j+2]=z;
@@ -2636,6 +2741,13 @@ function setCommon(prog){
   gl.uniform1f(u('uHalo'), ph.halo); gl.uniform1f(u('uAurora'), ph.aurora); gl.uniform1f(u('uBio'), ph.bio); gl.uniform1f(u('uSpray'), ph.spray);
   gl.uniform3fv(u('uAurSeed'), aur.seed); gl.uniform1f(u('uRipple'), ph.ripple); gl.uniform1f(u('uBeam'), beamAng); gl.uniform1f(u('uNight'), env.night); gl.uniform1f(u('uUnder'), cam.under?1:0);
   gl.uniform1i(u('uMoonTex'),1); gl.uniform1f(u('uMoonTexOn'), moonTex.tex?1:0);
+  { const on = skyTex.stars && skyTex.milky;
+    gl.uniform1f(u('uSkyTexOn'), on?1:0); gl.uniform1f(u('uLines'), (S.constLines && skyTex.lines)?1:0);
+    gl.uniform3fv(u('uCelP'), CEL_P); gl.uniform3fv(u('uCelM'), CEL_M); gl.uniform3fv(u('uCelE'), CEL_E); gl.uniform1f(u('uLST'), localSidereal());
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, skyTex.stars || dummyTex); gl.uniform1i(u('uStarTex'), 7);
+    gl.activeTexture(gl.TEXTURE8); gl.bindTexture(gl.TEXTURE_2D, skyTex.milky || dummyTex); gl.uniform1i(u('uMilkyTex'), 8);
+    gl.activeTexture(gl.TEXTURE9); gl.bindTexture(gl.TEXTURE_2D, skyTex.lines || dummyTex); gl.uniform1i(u('uLineTex'), 9);
+    gl.activeTexture(gl.TEXTURE0); }
   { const L = (S.quality>0 ? BG[S.water] : null) || []; const on=[0,0], el=[0,0], li=[0,0];
     for(let i=0;i<2;i++){ const d=L[i]; const t = d ? bgTexture(d.f) : null;
       gl.activeTexture(gl.TEXTURE2+i); gl.bindTexture(gl.TEXTURE_2D, t || dummyTex);
@@ -2691,7 +2803,7 @@ function drawObjects(){
   const a=env.amb, lum=(a[0]+a[1]+a[2])/3;
   if(cam.under){ gl.uniform3fv(p('uFogCol'), waterVolCPU()); gl.uniform1f(p('uFogD'), .08); }
   if(precip.nr>0 && !cam.under){ gl.uniform1f(p('uRound'),0); gl.uniform4f(p('uColor'), lum*.5+.02, lum*.55+.025, lum*.62+.03, .32); gl.bindVertexArray(rainG.vao); gl.drawArrays(gl.LINES,0,precip.nr*2); }
-  if(spray.n>0 && !cam.under){ gl.uniform1f(p('uRound'),1); const sl=(env.sunCol[0]+env.sunCol[1]+env.sunCol[2])/3*.05; gl.uniform1f(p('uPtSize'), U.tsu[3]>0 ? 1.6 : .5); gl.uniform4f(p('uColor'), lum*.42+sl+.01, lum*.44+sl+.01, lum*.46+sl+.012, U.tsu[3]>0 ? .3 : .55); gl.bindVertexArray(sprayG.vao); gl.drawArrays(gl.POINTS,0,spray.n); }
+  if(spray.n>0 && !cam.under){ gl.uniform1f(p('uRound'),1); const sl=(env.sunCol[0]+env.sunCol[1]+env.sunCol[2])/3*.05; const crestMode = U.tsu[3]<=0 && env.ph.spray < .05; gl.uniform1f(p('uPtSize'), U.tsu[3]>0 ? 1.6 : (crestMode ? .1 : .16)); gl.uniform4f(p('uColor'), lum*.42+sl+.01, lum*.44+sl+.01, lum*.46+sl+.012, U.tsu[3]>0 ? .3 : (crestMode ? .3 : .4)); gl.bindVertexArray(sprayG.vao); gl.drawArrays(gl.POINTS,0,spray.n); }
   if(cam.under && marine.n>0){ gl.uniform1f(p('uRound'),1); gl.uniform1f(p('uPtSize'),.06); const wc=waterVolCPU(); gl.uniform4f(p('uColor'), wc[0]*3+.002, wc[1]*3+.003, wc[2]*3+.004, .7); gl.bindVertexArray(snowG.vao); gl.drawArrays(gl.POINTS,0,marine.n); }
   if(precip.ns>0 && !cam.under){ gl.uniform1f(p('uRound'),1); gl.uniform1f(p('uPtSize'),.35); gl.uniform4f(p('uColor'), lum*.3+.01, lum*.3+.01, lum*.32+.012, .9); gl.bindVertexArray(snowG.vao); gl.drawArrays(gl.POINTS,0,precip.ns); }
   if(D.spout.s>.001){ gl.uniform1f(p('uRound'),1); gl.uniform1f(p('uPtSize'),2.2); gl.uniform4f(p('uColor'), lum*.3+.006, lum*.31+.006, lum*.33+.007, .28*D.spout.s); gl.bindVertexArray(spG.vao); gl.drawArrays(gl.POINTS,0,Math.floor(SP_N*.25)); }
@@ -2732,7 +2844,29 @@ function makeTarget(w, h, opts){
   return {tex, fb, depth, w, h};
 }
 function freeTarget(t){ if(!t) return; gl.deleteTexture(t.tex); if(t.depth) gl.deleteTexture(t.depth); gl.deleteFramebuffer(t.fb); }
-const RT = {scene:null, vol:null, near:null, far:null, env:null, q:-1, sw:0, sh:0, grid:null, gridQ:-1, envAge:99};
+function makeLaceTexture(){
+  const N = 256, G = 20, cell = N/G; const pts = [];
+  let seed = 7; const rnd = ()=>{ seed = (seed*16807) % 2147483647; return seed/2147483647; };
+  for(let j=0;j<G;j++) for(let i=0;i<G;i++) pts.push([(i + 0.15 + rnd()*0.7)*cell, (j + 0.15 + rnd()*0.7)*cell]);
+  const px = new Uint8Array(N*N*4);
+  for(let y=0;y<N;y++) for(let x=0;x<N;x++){
+    const ci = Math.floor(x/cell), cj = Math.floor(y/cell); let f1=1e9, f2=1e9;
+    for(let dj=-2;dj<=2;dj++) for(let di=-2;di<=2;di++){
+      const ii=(ci+di+G)%G, jj=(cj+dj+G)%G; const q=pts[jj*G+ii];
+      const qx=q[0]+(ci+di-((ci+di+G)%G))*cell, qy=q[1]+(cj+dj-((cj+dj+G)%G))*cell;
+      const d=Math.hypot(x-qx, y-qy); if(d<f1){ f2=f1; f1=d; } else if(d<f2) f2=d;
+    }
+    const wall = 1 - Math.min(1, Math.max(0, (f2 - f1 - 0.6)/2.6));      // bright on the walls between bubbles
+    const v = Math.round(255*Math.pow(wall, 1.3)), k=(y*N+x)*4;
+    px[k]=v; px[k+1]=v; px[k+2]=v; px[k+3]=255;
+  }
+  const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,N,N,0,gl.RGBA,gl.UNSIGNED_BYTE,px);
+  gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.REPEAT);
+  return t;
+}
+let laceTex = null;
+const RT = {scene:null, vol:null, near:null, far:null, env:null, foam:[null,null], foamIdx:0, foamL:null, foamReset:true, q:-1, sw:0, sh:0, grid:null, gridQ:-1, envAge:99};
 function ensureTargets(){
   const q = QUALITY[S.quality];
   const sw = Math.max(64, Math.round(W*q.cap*dyn.scale)), sh = Math.max(64, Math.round(H*q.cap*dyn.scale));
@@ -2743,7 +2877,8 @@ function ensureTargets(){
     RT.sw = sw; RT.sh = sh;
   }
   if(RT.q !== S.quality){
-    freeTarget(RT.near); freeTarget(RT.far); freeTarget(RT.env);
+    freeTarget(RT.near); freeTarget(RT.far); freeTarget(RT.env); freeTarget(RT.foam[0]); freeTarget(RT.foam[1]);
+    RT.foam = [makeTarget(q.near, q.near, {mip:true}), makeTarget(q.near, q.near, {mip:true})]; RT.foamReset = true;
     RT.near = makeTarget(q.near, q.near, {mip:true});
     RT.far  = makeTarget(q.far, q.far, {mip:true});
     RT.env  = makeTarget(q.env[0], q.env[1], {wrapS: gl.REPEAT});
@@ -2796,6 +2931,22 @@ function render(){
       drawFull();
       gl.bindTexture(gl.TEXTURE_2D, rt.tex); gl.generateMipmap(gl.TEXTURE_2D);
     }
+    // persistent foam: ping-pong between two textures on the near grid
+    if(!laceTex) laceTex = makeLaceTexture();
+    { const src = RT.foam[RT.foamIdx], dst = RT.foam[1 - RT.foamIdx];
+      if(RT.foamReset){ for(const t of RT.foam){ gl.bindFramebuffer(gl.FRAMEBUFFER, t.fb); gl.clearColor(0,10,0,1); gl.clear(gl.COLOR_BUFFER_BIT); } RT.foamReset=false; RT.foamL = nearL; }
+      gl.useProgram(foamProg); setCommon(foamProg); const fu = foamProg.u;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fb); gl.viewport(0,0,dst.w,dst.h);
+      gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, src.tex); gl.uniform1i(fu('uFoamPrev'), 4);
+      gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, RT.near.tex); gl.uniform1i(fu('uWaveTex'), 5);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.uniform4fv(fu('uCurL'), nearL); gl.uniform4fv(fu('uPrevL'), RT.foamL); gl.uniform2f(fu('uLevelRes'), dst.w, dst.h);
+      gl.uniform1f(fu('uDt'), Math.min(frameDt, 0.1));
+      drawFull();
+      gl.bindTexture(gl.TEXTURE_2D, dst.tex); gl.generateMipmap(gl.TEXTURE_2D);
+      RT.foamIdx = 1 - RT.foamIdx; RT.foamL = nearL;
+      for(const unit of [4,5]){ gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D, dummyTex); } gl.activeTexture(gl.TEXTURE0);
+    }
     // 2) reflection environment (sky + far scenery), refreshed every few frames
     const sky = full ? skyFull : skyLite;
     if(++RT.envAge >= 4){
@@ -2822,6 +2973,9 @@ function render(){
     gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, RT.near.tex); gl.uniform1i(m('uNearTex'), 4);
     gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, RT.far.tex);  gl.uniform1i(m('uFarTex'), 5);
     gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, RT.env.tex);  gl.uniform1i(m('uEnvTex'), 6);
+    gl.activeTexture(gl.TEXTURE10); gl.bindTexture(gl.TEXTURE_2D, RT.foam[RT.foamIdx].tex); gl.uniform1i(m('uFoamTex'), 10);
+    gl.activeTexture(gl.TEXTURE11); gl.bindTexture(gl.TEXTURE_2D, laceTex || dummyTex); gl.uniform1i(m('uLaceTex'), 11);
+    gl.uniform4fv(m('uFoamL'), RT.foamL || nearL); gl.uniform1f(m('uFoamOn'), 1);
     gl.activeTexture(gl.TEXTURE0);
     gl.depthFunc(gl.LESS);
     gl.bindVertexArray(RT.grid.vao); gl.drawElements(gl.TRIANGLES, RT.grid.count, gl.UNSIGNED_INT, 0);
@@ -2849,7 +3003,7 @@ function render(){
   gl.uniform1f(f('uExposure'), C.exposure); gl.uniform1f(f('uTime'), simTime);
   drawFull();
   // unbind render targets from texture units so the next frame never samples what it is drawing into
-  for(const unit of [0,1,4,5,6]){ gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D, dummyTex); }
+  for(const unit of [0,1,4,5,6,10]){ gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D, dummyTex); }
   gl.activeTexture(gl.TEXTURE0);
   gl.enable(gl.DEPTH_TEST);
 }
@@ -3016,7 +3170,7 @@ $('#ph-list').innerHTML = PHX.map(x=>`<div class="ph-row"><div class="ph-top"><s
 function syncPh(){ for(const g of document.querySelectorAll('[data-ph]')) for(const b of g.children) b.setAttribute('aria-checked', +b.dataset.m===S.ph[g.dataset.ph]); }
 $('#ph-list').addEventListener('click',e=>{ const b=e.target.closest('[data-m]'); if(!b) return; const g=b.parentElement; S.ph[g.dataset.ph]=+b.dataset.m; syncPh(); save(); });
 syncPh();
-bindSwitch('#cruise','cruise'); bindSwitch('#rogue-auto','rogueAuto');
+bindSwitch('#cruise','cruise'); bindSwitch('#const-lines','constLines'); bindSwitch('#rogue-auto','rogueAuto');
 bindSwitch('#show-boats','showBoats');
 $('#btn-reset-boats').addEventListener('click', resetBoats); bindSwitch('#show-buoys','showBuoys');
 function syncShips(){ $('#cam-ride').disabled = !S.showBoats; if(!S.showBoats && cam.ride) setRide(false); }
@@ -3054,12 +3208,12 @@ $('#btn-clear').addEventListener('click',()=>{
 
 /* ================= Loop ================= */
 const autoQ = {t:0, n:0, sum:0, done:false, up:0};
-let last=performance.now(), flowSync=0, hudT=0;
+let last=performance.now(), flowSync=0, hudT=0, frameDt=1/60;
 function frame(now){
   if(!checkReady()){ if(!failed) requestAnimationFrame(frame); return; }
   if(fullState==='ready' && !autoQ.done && S.quality===0 && autoQ.fullKick!==true){ autoQ.fullKick=true; autoQ.n=0; autoQ.sum=0; autoQ.t=0; }
   const raw=(now-last)/1000;
-  const dt=Math.min(.05,raw); last=now; simTime+=dt;
+  const dt=Math.min(.05,raw); last=now; simTime+=dt; frameDt=dt;
   if(!autoQ.done && raw>.4 && S.quality>0){ S.quality=0; syncQuality(); resize(); autoQ.n=0; autoQ.sum=0; autoQ.t=0; }
   if(S.timeFlow){ const dh=dt*S.timeRate/3600; S.time=(S.time+dh)%24; S.moon=(S.moon+dh/(29.53*24))%1; if(flowSync+dt>.5) syncSlider('moon'); flowSync+=dt; if(flowSync>.5){ flowSync=0; syncSlider('time'); save(); } }
   updateEnv(dt); updateDisasters(dt); updateWaves(dt); updateCamera(dt); updateObjects(dt);
