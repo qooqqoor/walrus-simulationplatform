@@ -1159,7 +1159,12 @@ vec3 shadeSea(vec3 ro, vec3 rd, float t, bool hit, out vec3 pOut){
   float wcov = clamp(3.84e-6*pow(max(uWind,0.0),3.41), 0.0, 0.25); float wthr = mix(1.02, 0.35, clamp(sqrt(wcov/0.12),0.0,1.0));
   float cap = smoothstep(wthr, wthr + 0.16, cr*0.75 + dhn*0.45 + (nz - 0.5)*0.5)*smoothstep(2.5, 4.5, uWind)*uFoam;
   vec2 wp = vec2(-uWindDir.y, uWindDir.x);
-  float streak = smoothstep(0.62,0.9, noise(vec2(dot(p.xz,uWindDir)*0.015, dot(p.xz,wp)*0.22)))*smoothstep(13.0,30.0,uWind)*0.7*uFoam;
+  // wind streaks (Beaufort 7+): thin, wandering, broken lines of old foam, faint and fading with distance
+  float sa = dot(p.xz,uWindDir), sc = dot(p.xz,wp);
+  sc += (noise(vec2(sa*0.008, sc*0.015)) - 0.5)*30.0 + (noise(vec2(sa*0.03, sc*0.05)) - 0.5)*6.0;
+  float sline = 1.0 - abs(noise(vec2(sa*0.005, sc*0.28))*2.0 - 1.0);
+  float sbreak = smoothstep(0.4, 0.75, noise(vec2(sa*0.025, sc*0.04) + uWindDir*uTime*0.05));
+  float streak = smoothstep(0.86, 0.97, sline)*sbreak*smoothstep(14.0,30.0,uWind)*0.35*uFoam*(1.0 - smoothstep(150.0, 900.0, t));
   float wakeFoam = clamp(wakeF,0.0,1.0)*smoothstep(0.35,0.85,noise(p.xz*0.9 + uTime*0.5)*0.7 + wakeF*0.5)*0.75;
   float hazard = disasterFoam(p.xz, nz);
   float foam = clamp(cap + streak + wakeFoam*0.8 + hazard*(0.55+0.45*nz), 0.0, 1.0)*(1.0 - 0.5*smoothstep(600.0,3000.0,t));
@@ -1578,7 +1583,12 @@ vec3 shadeSeaM(vec3 ro, vec3 rd, float t, vec3 p){
   float wcov = clamp(3.84e-6*pow(max(uWind,0.0),3.41), 0.0, 0.25); float wthr = mix(1.02, 0.35, clamp(sqrt(wcov/0.12),0.0,1.0));
   float cap = smoothstep(wthr, wthr + 0.16, cr*0.75 + dhn*0.45 + (nz - 0.5)*0.5)*smoothstep(2.5, 4.5, uWind)*uFoam;
   vec2 wp = vec2(-uWindDir.y, uWindDir.x);
-  float streak = smoothstep(0.62,0.9, noise(vec2(dot(p.xz,uWindDir)*0.015, dot(p.xz,wp)*0.22)))*smoothstep(13.0,30.0,uWind)*0.7*uFoam;
+  // wind streaks (Beaufort 7+): thin, wandering, broken lines of old foam, faint and fading with distance
+  float sa = dot(p.xz,uWindDir), sc = dot(p.xz,wp);
+  sc += (noise(vec2(sa*0.008, sc*0.015)) - 0.5)*30.0 + (noise(vec2(sa*0.03, sc*0.05)) - 0.5)*6.0;
+  float sline = 1.0 - abs(noise(vec2(sa*0.005, sc*0.28))*2.0 - 1.0);
+  float sbreak = smoothstep(0.4, 0.75, noise(vec2(sa*0.025, sc*0.04) + uWindDir*uTime*0.05));
+  float streak = smoothstep(0.86, 0.97, sline)*sbreak*smoothstep(14.0,30.0,uWind)*0.35*uFoam*(1.0 - smoothstep(150.0, 900.0, t));
   float wakeFoam = clamp(wakeF,0.0,1.0)*smoothstep(0.35,0.85,noise(p.xz*0.9 + uTime*0.5)*0.7 + wakeF*0.5)*0.75;
   float hazard = disasterFoam(p.xz, nz);
   float foam = clamp(cap + streak + wakeFoam*0.8 + hazard*(0.55+0.45*nz), 0.0, 1.0)*(1.0 - 0.5*smoothstep(600.0,3000.0,t));
@@ -1588,7 +1598,7 @@ vec3 shadeSeaM(vec3 ro, vec3 rd, float t, vec3 p){
     vec2 uf = (p.xz - uFoamL.xy)/uFoamL.z + 0.5; float fw = edgeW(uf);
     if(fw > 0.0){
       vec2 fa = textureLod(uFoamTex, uf, log2(max(t*uPix/uFoamL.w, 1.0))).rg;
-      foam = mix(foam, clamp(fa.x + streak*0.5, 0.0, 1.0), fw); age = mix(10.0, fa.y, fw);
+      foam = mix(foam, clamp(fa.x + streak*0.6, 0.0, 1.0), fw); age = mix(10.0, mix(fa.y, 8.0, clamp(streak*2.0 - fa.x, 0.0, 1.0)), fw);
     }
   }
   // whitewater: bubbly, self-shadowed, translucent where thin
