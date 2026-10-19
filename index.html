@@ -313,7 +313,10 @@ const fmtTime = t => { const h=Math.floor(t)%24, m=Math.floor((t%1)*60); return 
 const rainRate = p => p*p*80;
 const MOON_NAMES=['新月','眉月','上弦月','盈凸月','滿月','虧凸月','下弦月','殘月'];
 const moonName = v => `${MOON_NAMES[Math.round(v*8)%8]} · 月齡 ${(v*29.53).toFixed(1)} 天 · 亮面 ${Math.round((1-Math.cos(v*6.2832))/2*100)}%`;
-const QUALITY = [{name:'低', scale:.5, steps:56, maxPx:.38e6, rays:5}, {name:'中', scale:.7, steps:80, maxPx:.8e6, rays:8}, {name:'高', scale:1, steps:110, maxPx:1.5e6, rays:12}];
+const QUALITY = [
+  {name:'低', scale:.5, steps:56, maxPx:.38e6, rays:5, cap:.6, near:512, far:512, grid:[112,224], env:[512,128]},
+  {name:'中', scale:.7, steps:80, maxPx:.8e6, rays:8, cap:.8, near:768, far:768, grid:[144,300], env:[768,192]},
+  {name:'高', scale:1, steps:110, maxPx:1.5e6, rays:12, cap:1, near:1024, far:1024, grid:[176,360], env:[1024,256]}];
 
 /* ================= WebGL2 setup ================= */
 const canvas = $('#sea');
@@ -343,6 +346,9 @@ function programCheck(p){
 
 const TONEMAP = `
 uniform float uExposure;
+#ifdef HDR_OUT
+vec3 toneMap(vec3 c){ return c; }
+#else
 vec3 rrtOdt(vec3 v){ vec3 a=v*(v+0.0245786)-0.000090537; vec3 b=v*(0.983729*v+0.4329510)+0.238081; return a/b; }
 vec3 toneMap(vec3 c){
   c *= uExposure/0.6;
@@ -351,7 +357,9 @@ vec3 toneMap(vec3 c){
   c = mat3(1.60475,-0.10208,-0.00327, -0.53108,1.10813,-0.07276, -0.07367,-0.00605,1.07602)*c;
   c = clamp(c,0.0,1.0);
   return mix(c*12.92, 1.055*pow(c,vec3(1.0/2.4))-0.055, step(vec3(0.0031308),c));
-}`;
+}
+#endif
+`;
 
 const SEA_VS = `#version 300 es
 layout(location=0) in vec2 aPos; out vec2 vNdc;
@@ -359,6 +367,7 @@ void main(){ vNdc = aPos; gl_Position = vec4(aPos,0.0,1.0); }`;
 
 const SEA_FS = `#version 300 es
 precision highp float;
+precision highp int;
 __VARIANT__
 #ifdef FULL
 const bool FULLQ = true;
@@ -366,6 +375,9 @@ const bool FULLQ = true;
 const bool FULLQ = false;
 #endif
 in vec2 vNdc; out vec4 outColor;
+#ifdef MODE_SEA
+in vec3 vP; in float vT;
+#endif
 uniform vec3 uCamPos; uniform mat3 uCamRot; uniform float uTanH; uniform float uAspect; uniform mat4 uVP; uniform float uPix;
 uniform float uTime; uniform int uSteps; uniform int uRaySteps; uniform int uNSw; uniform int uRefine; uniform int uUpSteps;
 uniform int uDTr; uniform int uDRf; uniform int uDN; uniform int uAurA; uniform int uAurB;
@@ -1343,6 +1355,268 @@ vec4 spoutVol(vec3 ro, vec3 rd, float tMax){
 vec4 tsuMist(vec3 ro, vec3 rd, float tMax){ return vec4(0.0); }
 vec4 spoutVol(vec3 ro, vec3 rd, float tMax){ return vec4(0.0); }
 #endif
+
+/* ================= analytic wave gradients (wave texture pass and far sea) ================= */
+void swellG(vec2 p, float t, out float h, out vec2 g){
+  h = 0.0; g = vec2(0.0); float fp = t*uPix*8.0;
+  for(int i=0;i<uNSw;i++){
+    vec4 w = uW[i]; float lam = 6.2831853/w.w;
+    float a = w.z*clamp(lam/(fp+1e-3)-1.0, 0.0, 1.0);
+    float f = w.w*dot(w.xy,p) - uPh[i]; float s = 0.5 + 0.5*sin(f);
+    float sk = pow(max(s,1e-4), uKExp - 1.0);
+    h += a*(2.0*sk*s - 1.0); g += a*uKExp*sk*cos(f)*w.w*w.xy;
+  }
+}
+void detailG(vec2 p, float t, int n, out float h, out vec2 g){
+  h = 0.0; g = vec2(0.0); float fp = t*uPix*7.0;
+  for(int i=0;i<n;i++){
+    vec4 w = uDW[i]; float lam = 6.2831853/w.w;
+    float fade = clamp(lam/(fp+1e-3)-1.0, 0.0, 1.0);
+    if(fade <= 0.0) break;
+    float f = w.w*dot(w.xy,p) - uDPh[i]; float s = 0.5 + 0.5*sin(f);
+    float sk = pow(max(s,1e-4), uKExp - 1.0);
+    h += w.z*fade*(2.0*sk*s - 1.0); g += w.z*fade*uKExp*sk*cos(f)*w.w*w.xy;
+  }
+}
+
+#ifdef MODE_WAVE
+uniform vec4 uLevel; uniform vec2 uLevelRes; uniform float uExtraOn;
+float extraH(vec2 p){ float wf, ct; return disasterH(p) + wakeH(p, wf, ct); }
+void main(){
+  vec2 uv = gl_FragCoord.xy/uLevelRes;
+  vec2 p = uLevel.xy + (uv - 0.5)*uLevel.z;
+  float t = uLevel.w;
+  float hs, hd; vec2 gs, gd;
+  swellG(p, t, hs, gs); detailG(p, t, uDN, hd, gd);
+  float he = 0.0; vec2 ge = vec2(0.0);
+  if(uExtraOn > 0.5){
+    float e = max(uLevel.z/uLevelRes.x*0.5, 0.05);
+    float h0 = extraH(p);
+    he = h0; ge = vec2(extraH(p+vec2(e,0.0)) - h0, extraH(p+vec2(0.0,e)) - h0)/e;
+  }
+  outColor = vec4(hs + hd + he, gs + gd + ge, hd);
+}
+#endif
+
+#ifdef MODE_SEA
+uniform sampler2D uNearTex; uniform sampler2D uFarTex; uniform sampler2D uEnvTex;
+uniform vec4 uNearL; uniform vec4 uFarL;
+float edgeW(vec2 u){ return smoothstep(0.0, 0.06, min(min(u.x,u.y), min(1.0-u.x,1.0-u.y))); }
+vec4 waveAt(vec2 p, float t, out float texel){
+  vec2 un = (p - uNearL.xy)/uNearL.z + 0.5, uf = (p - uFarL.xy)/uFarL.z + 0.5;
+  float wn = edgeW(un), wf = edgeW(uf);
+  float hs; vec2 gs; swellG(p, t, hs, gs);
+  vec4 a = vec4(hs, gs, 0.0);
+  float foot = t*uPix;
+  texel = 1e4;
+  if(wf > 0.0){ a = mix(a, textureLod(uFarTex, uf, log2(max(foot/uFarL.w, 1.0))), wf); texel = uFarL.w; }
+  if(wn > 0.0){ a = mix(a, textureLod(uNearTex, un, log2(max(foot/uNearL.w, 1.0))), wn); if(wn > 0.5) texel = uNearL.w; }
+  return a;
+}
+vec3 envRefl(vec3 r){
+  float u = atan(r.x, -r.z)/6.2831853 + 0.5;
+  float v = asin(clamp(r.y, 0.0, 1.0))/1.5707963;
+  return textureLod(uEnvTex, vec2(u, v), 0.0).rgb;
+}
+vec3 meshNormal(vec2 p, float t, out float cr, out float dh){
+  float texel; vec4 w = waveAt(p, t, texel);
+  vec2 g = w.yz; dh = w.w;
+  // short waves the texture cannot hold: added per pixel, faded by the pixel footprint
+  float fp = t*uPix*7.0, lim = texel*2.5;
+  if(t < 400.0){
+    for(int i=0;i<uDN;i++){
+      vec4 d = uDW[i]; float lam = 6.2831853/d.w;
+      float wPix = clamp(lam/(fp+1e-3)-1.0, 0.0, 1.0);
+      if(wPix <= 0.0) break;
+      float k = max(wPix - clamp(lam/lim - 1.0, 0.0, 1.0), 0.0);
+      if(k <= 0.0) continue;
+      float f = d.w*dot(d.xy,p) - uDPh[i]; float s = 0.5 + 0.5*sin(f);
+      float sk = pow(max(s,1e-4), uKExp - 1.0);
+      g += d.z*k*uKExp*sk*cos(f)*d.w*d.xy; dh += d.z*k*(2.0*sk*s - 1.0);
+    }
+  }
+  swell(p, t, cr);
+  return normalize(vec3(-g.x, 1.0, -g.y));
+}
+vec3 shadeSeaM(vec3 ro, vec3 rd, float t, vec3 p){
+  float cr, dh;
+  vec3 n = meshNormal(p.xz, t, cr, dh);
+  float wakeF, contact; wakeH(p.xz, wakeF, contact);
+  float visC = lightVis(p);
+  float tsh = tsuShadow(p);
+  float vis = visC*mix(0.06, 1.0, tsh);
+  if(FULLQ && uRipple > 0.0 && t < 60.0){ vec2 g = ripples(p.xz); n = normalize(n + vec3(g.x,0.0,g.y)*uRipple*0.4*(1.0-t/60.0)); }
+  // ice floes (polar)
+  float ice = 0.0;
+  if(uIce > 0.0){
+    vec2 ip = p.xz*0.014 + vec2(uTime*0.0015, uTime*0.001);
+    float iN = fbm(ip,4) + (noise(p.xz*0.35)-0.5)*0.035;
+    ice = smoothstep(0.575,0.585, iN)*uIce;
+    ice = max(ice, smoothstep(0.78,0.86, noise(p.xz*0.25))*uIce*0.6*smoothstep(0.45,0.55,fbm(ip*1.7,3)));
+  }
+  float cosi = clamp(dot(n,-rd),0.0,1.0);
+  float F = 0.02 + 0.98*pow(1.0-cosi,5.0);
+  vec3 r = reflect(rd,n); r = normalize(vec3(r.x, abs(r.y)+0.005, r.z));
+  vec3 refl = envRefl(r);
+  // water body: volume colour, plus the sea floor where it is shallow and clear
+  float up = max(uLightDir.y,0.0);
+  vec3 body = waterVolume();
+  vec2 vh = normalize(rd.xz+vec2(1e-4)); vec2 lh = normalize(uLightDir.xz+vec2(1e-4));
+  float sss = pow(clamp(dot(vh,lh),0.0,1.0),4.0)*smoothstep(0.1,0.9,cr + dh/(uDetail+0.01)*0.3)*(1.0-up*0.6);
+  body += uShallow*uClarity*uSunCol*vis*(0.10*sss + 0.012*max(cr,0.0))/PI;
+#ifdef FULL
+  if(uBedDepth < 200.0){
+    vec3 tr = refract(rd, n, 0.752); tr.y = min(tr.y, -0.05);
+    float L = (p.y + uBedDepth)/(-tr.y);
+    if(L < 400.0){
+      vec2 bp = p.xz + tr.xz*L;
+      vec3 E = uSunCol*up*lightVis(vec3(bp.x,0.0,bp.y))*(0.35 + caustics(bp)*1.8) + uAmb;
+      vec3 bed = bedAlbedo(bp)*E/PI*exp(-uAbsorb*uBedDepth);
+      vec3 T = exp(-uAbsorb*L);
+      body = bed*T + body*(1.0-T);
+    }
+  }
+#endif
+  if(uTsu.w > 0.0){
+    float d, A; tsuShape(p.xz, d, A);
+    float murk = step(d,0.0)*exp(d/900.0)*min(A/8.0,1.0);
+    body = mix(body, vec3(0.06,0.045,0.025)*(uAmb + uSunCol*up)/PI*1.6, murk*0.75);
+    // sunlight passing through the thin upper face: the glowing green-blue band under a breaking crest
+    float W = uTsuW;
+    float thinBand = smoothstep(-W*0.55, -W*0.05, d)*(1.0 - smoothstep(W*0.05, W*0.5, d));
+    float hgt = clamp(p.y/(A + 1e-3), 0.0, 1.0);
+    vec2 vdir = normalize(rd.xz + vec2(1e-4)), ldir = normalize(uLightDir.xz + vec2(1e-4));
+    float behind = pow(clamp(dot(vdir, ldir), 0.0, 1.0), 1.5)*(0.35 + 0.65*clamp(dot(rd, uLightDir)*0.5 + 0.5, 0.0, 1.0));
+    float thin = thinBand*hgt*hgt*(0.6 + 0.4*noise(p.xz*0.08 + uTime*0.3));
+    vec3 glow = mix(vec3(0.03,0.55,0.42), uShallow*3.0, 0.35)*(1.0 - murk*0.6);
+    body += glow*uSunCol*visC*thin*(behind*1.4 + 0.12)/PI;
+    body *= mix(1.0, 0.55, (1.0 - tsh)*thinBand*0.6);
+  }
+  vec3 col = mix(body, refl, F);
+  // sun / moon glitter (GGX)
+  float alpha = clamp(0.045 + uWind*0.0025 + t*uPix*0.12 + uRain*0.08, 0.03, 0.6);
+  vec3 hv = normalize(uLightDir - rd);
+  float ndh = max(dot(n,hv),0.0); float a2 = alpha*alpha;
+  float dd = ndh*ndh*(a2-1.0)+1.0; float D = a2/(PI*dd*dd);
+  float ndl = dot(n,uLightDir);
+  float Fh = 0.02 + 0.98*pow(1.0-max(dot(hv,-rd),0.0),5.0);
+  col += uSunCol*vis*D*Fh/(4.0*max(cosi,0.08))*clamp(ndl*4.0,0.0,1.0)*(1.0-ice);
+  // foam: whitecaps, wind streaks, wakes, hazards
+  float nz = noise(p.xz*0.035 + uWindDir*uTime*0.3)*0.65 + noise(p.xz*0.13 - uTime*0.2)*0.35;
+  float wfac = smoothstep(4.0, 16.0, uWind);
+  float dhn = dh/(uDetail+0.01);
+  float cap = smoothstep(0.45, 0.85, cr*0.75 + dhn*0.45 + nz*0.35 - 0.15 + smoothstep(12.0,30.0,uWind)*0.15)*wfac*uFoam;
+  vec2 wp = vec2(-uWindDir.y, uWindDir.x);
+  float streak = smoothstep(0.62,0.9, noise(vec2(dot(p.xz,uWindDir)*0.015, dot(p.xz,wp)*0.22)))*smoothstep(13.0,30.0,uWind)*0.7*uFoam;
+  float wakeFoam = clamp(wakeF,0.0,1.0)*smoothstep(0.35,0.85,noise(p.xz*0.9 + uTime*0.5)*0.7 + wakeF*0.5)*0.75;
+  float hazard = disasterFoam(p.xz, nz);
+  float foam = clamp(cap + streak + wakeFoam*0.8 + hazard*(0.55+0.45*nz), 0.0, 1.0)*(1.0 - 0.5*smoothstep(600.0,3000.0,t));
+  // whitewater: bubbly, self-shadowed, translucent where thin
+  float fq = noise(p.xz*0.9 + uTime*0.4)*0.5 + noise(p.xz*3.1 - uTime*0.7)*0.3 + noise(p.xz*0.23 + uTime*0.1)*0.2;
+  float cover = clamp(foam*(0.55 + 0.9*fq), 0.0, 1.0);
+  float fshade = mix(0.45, 1.08, smoothstep(0.2, 0.85, fq));
+  vec3 foamCol = vec3(0.84,0.87,0.88)*(uSunCol*vis*max(dot(n,uLightDir),0.0)*fshade + uAmb*mix(0.65,1.0,fq))/PI;
+  vec3 thinCol = foamCol*vec3(0.62,0.86,0.84) + uShallow*uClarity*uSunCol*visC*0.06/PI;
+  foamCol = mix(thinCol, foamCol, smoothstep(0.25, 0.85, cover));
+  col = mix(col, foamCol, smoothstep(0.0, 0.9, cover));
+  // spindrift in strong wind
+  if(uSpray > 0.0){
+    float sp = uSpray*smoothstep(0.35,0.85, cr*0.6 + dhn*0.5 + noise(vec2(dot(p.xz,uWindDir)*0.05 - uTime*2.0, dot(p.xz,wp)*0.4))*0.5);
+    col = mix(col, foamCol*1.15, sp*0.55);
+  }
+  if(ice > 0.0){
+    vec3 ni = normalize(mix(n, vec3(0.0,1.0,0.0), 0.85));
+    float snowT = 0.82 + 0.18*noise(p.xz*0.6) - 0.1*smoothstep(0.6,0.9,noise(p.xz*0.08));
+    vec3 ic = vec3(0.86,0.89,0.93)*snowT*(uSunCol*vis*max(dot(ni,uLightDir),0.0) + uAmb)/PI;
+    col = mix(col, ic, clamp(ice,0.0,1.0));
+  }
+  // bioluminescence (blue tears)
+  if(uBio > 0.0){
+    float spark = smoothstep(0.72,1.0, noise(p.xz*2.7 + uTime*vec2(1.3,-0.8)))*0.8 + 0.2;
+    float stir = cap*1.6 + wakeFoam*2.0 + hazard + contact*1.5 + uRipple*smoothstep(0.85,1.0,noise(p.xz*4.0+uTime*3.0))*2.0 + streak;
+    col += vec3(0.02,0.30,1.0)*uBio*(stir*spark*0.5 + spark*0.012*exp(-t*0.02));
+  }
+  col += uFlash*vec3(0.05,0.055,0.07);
+  if(uSmoke > 0.0) col = mix(col, fogColor(rd)*1.05, uSmoke*(1.0-exp(-t*0.004))*0.65);
+  float ff = 1.0 - exp(-t*uFogD);
+  ff = max(ff, smoothstep(3000.0, 6000.0, t));
+  return mix(col, fogColor(rd), ff);
+}
+
+void main(){
+  vec3 ro = uCamPos; vec3 p = vP;
+  vec3 dv = p - ro; float t = length(dv); vec3 rd = dv/t;
+  vec3 col = shadeSeaM(ro, rd, t, p);
+  if(uRainbow > 0.0 && uSunDir.y > 0.0){
+    float alex; vec3 rb = rainbow(rd, alex);
+    float k = uRainbow*mix(0.35,1.0,lightVis(ro))*smoothstep(40.0,400.0,t)*smoothstep(-0.02,0.0,rd.y+0.05);
+    col = col*(1.0 - alex*0.18*k) + rb*uSunT*0.03*k;
+  }
+  if(uSpray > 0.0) col = mix(col, fogColor(rd)*1.1, uSpray*0.3*exp(-max(rd.y,0.0)*30.0)*(1.0-exp(-t*0.01)));
+  outColor = vec4(col, 1.0);
+}
+#endif
+
+#ifdef MODE_SKY
+uniform float uEnvMode; uniform vec2 uEnvRes;
+void main(){
+  vec3 ro = uCamPos;
+  if(uEnvMode > 0.5){
+    // reflection environment: upper hemisphere as an equirect strip, sky + far scenery
+    vec2 uv = gl_FragCoord.xy/uEnvRes;
+    float az = (uv.x - 0.5)*6.2831853, el = uv.y*1.5707963;
+    vec3 r = vec3(sin(az)*cos(el), sin(el), -cos(az)*cos(el));
+    vec3 c; vec3 lc; float ld;
+    if(land(ro, r, false, lc, ld)) c = lc; else c = skyView(r, false, 2);
+    outColor = vec4(c, 1.0);
+    return;
+  }
+  vec3 rd = normalize(uCamRot*vec3(vNdc.x*uTanH*uAspect, vNdc.y*uTanH, -1.0));
+  vec3 col; float depth = 1.0;
+  vec3 lc; float ld;
+  if(sceneryWithMirage(ro, rd, lc, ld)){
+    col = lc;
+    vec4 clip = uVP*vec4(ro + rd*min(ld,15000.0),1.0); depth = clamp(clip.z/clip.w*0.5+0.5, 0.0, 0.99999);
+  } else if(rd.y < 0.0){
+    col = fogColor(rd);
+  } else {
+    col = skyView(rd, true, 5);
+    if(uMirage > 0.0 && rd.y < 0.0025*uMirage) col = mix(col, fogColor(rd)*0.92, uMirage*0.5);
+    if(uRainbow > 0.0 && uSunDir.y > 0.0){
+      float alex; vec3 rb = rainbow(rd, alex);
+      float k = uRainbow*mix(0.35,1.0,lightVis(ro))*smoothstep(-0.02,0.0,rd.y+0.05);
+      col = col*(1.0 - alex*0.18*k) + rb*uSunT*0.03*k;
+    }
+  }
+  if(uSpray > 0.0) col = mix(col, fogColor(rd)*1.1, uSpray*0.3*exp(-max(rd.y,0.0)*30.0));
+  outColor = vec4(col, 1.0);
+  gl_FragDepth = depth;
+}
+#endif
+
+#ifdef MODE_VOL
+uniform sampler2D uDepthTex; uniform vec2 uNF;
+void main(){
+  vec3 ro = uCamPos;
+  vec3 rd = normalize(uCamRot*vec3(vNdc.x*uTanH*uAspect, vNdc.y*uTanH, -1.0));
+  float d = texture(uDepthTex, vNdc*0.5 + 0.5).r;
+  float tEnd = 4000.0;
+  if(d < 0.99999){
+    float zn = d*2.0 - 1.0, n = uNF.x, f = uNF.y;
+    float zEye = 2.0*n*f/(f + n - zn*(f - n));
+    vec3 fwd = uCamRot*vec3(0.0, 0.0, -1.0);
+    tEnd = zEye/max(dot(rd, fwd), 1e-3);
+  }
+  vec3 R = vec3(0.0); float T = 1.0;
+  vec4 sv = spoutVol(ro, rd, tEnd); R = R*(1.0-sv.a) + sv.rgb; T *= 1.0-sv.a;
+  vec4 tm = tsuMist(ro, rd, tEnd);  R = R*(1.0-tm.a) + tm.rgb; T *= 1.0-tm.a;
+  vec4 gr = godrays(ro, rd, tEnd);  R = R*(1.0-gr.a) + gr.rgb; T *= 1.0-gr.a;
+  R += beam(ro, rd, tEnd);
+  outColor = vec4(R, 1.0 - T);
+}
+#endif
+
+#if !defined(MODE_WAVE) && !defined(MODE_SEA) && !defined(MODE_SKY) && !defined(MODE_VOL)
 void main(){
   vec3 rd = normalize(uCamRot*vec3(vNdc.x*uTanH*uAspect, vNdc.y*uTanH, -1.0));
   vec3 ro = uCamPos;
@@ -1376,10 +1650,15 @@ void main(){
     col += beam(ro, rd, tEnd);
     if(uSpray > 0.0) col = mix(col, fogColor(rd)*1.1, uSpray*0.3*exp(-max(rd.y,0.0)*30.0)*(sea ? 1.0-exp(-tEnd*0.01) : 1.0));
   }
+#ifdef HDR_OUT
+  outColor = vec4(col, 1.0);
+#else
   vec3 o = toneMap(col) + (hash(gl_FragCoord.xy + fract(uTime)*91.0)-0.5)/255.0;
   outColor = vec4(o, 1.0);
+#endif
   gl_FragDepth = depth;
 }
+#endif
 `;
 
 const OBJ_VS = `#version 300 es
@@ -1416,23 +1695,120 @@ void main(){
   outColor = vec4(toneMap(mix(uFogCol, uColor.rgb, f)), a*(0.25+0.75*f));
 }`;
 
+const MESH_VS = `#version 300 es
+precision highp float; precision highp int; precision highp sampler2D;
+layout(location=0) in vec2 aPos;
+uniform vec3 uCamPos; uniform mat3 uCamRot; uniform float uTanH; uniform float uAspect; uniform float uYTop; uniform mat4 uVP;
+uniform float uPix; uniform float uKExp; uniform int uNSw; uniform vec4 uW[8]; uniform float uPh[8];
+uniform sampler2D uNearTex; uniform sampler2D uFarTex; uniform vec4 uNearL; uniform vec4 uFarL;
+out vec3 vP; out float vT;
+float edgeW(vec2 u){ return smoothstep(0.0, 0.06, min(min(u.x,u.y), min(1.0-u.x,1.0-u.y))); }
+float swellA(vec2 p, float t){
+  float h = 0.0; float fp = t*uPix*8.0;
+  for(int i=0;i<uNSw;i++){
+    vec4 w = uW[i]; float lam = 6.2831853/w.w;
+    float a = w.z*clamp(lam/(fp+1e-3)-1.0, 0.0, 1.0);
+    float s = 0.5 + 0.5*sin(w.w*dot(w.xy,p) - uPh[i]);
+    h += a*(2.0*pow(max(s,1e-4),uKExp) - 1.0);
+  }
+  return h;
+}
+void main(){
+  // projected grid: each vertex is a screen position pushed out to the sea plane, then displaced
+  vec2 ndc = vec2(mix(-1.12, 1.12, aPos.x), mix(-1.3, uYTop, aPos.y));
+  vec3 rd = uCamRot*vec3(ndc.x*uTanH*uAspect, ndc.y*uTanH, -1.0);
+  rd = normalize(rd); rd.y = min(rd.y, -0.00035);
+  float h0 = max(uCamPos.y, 0.6);
+  float t = min(h0/(-rd.y), 16000.0);
+  vec2 p = uCamPos.xz + rd.xz*t;
+  float tt = length(vec3(p.x, 0.0, p.y) - uCamPos);
+  vec2 un = (p - uNearL.xy)/uNearL.z + 0.5, uf = (p - uFarL.xy)/uFarL.z + 0.5;
+  float wn = edgeW(un), wf = edgeW(uf);
+  float h = swellA(p, tt);
+  if(wf > 0.0) h = mix(h, textureLod(uFarTex, uf, 0.0).x, wf);
+  if(wn > 0.0) h = mix(h, textureLod(uNearTex, un, 0.0).x, wn);
+  vP = vec3(p.x, h, p.y); vT = tt;
+  gl_Position = uVP*vec4(vP, 1.0);
+}`;
+const FINAL_FS = `#version 300 es
+precision highp float;
+in vec2 vNdc; out vec4 outColor;
+uniform sampler2D uScene; uniform sampler2D uVol; uniform vec2 uTexel; uniform float uSharp; uniform float uVolOn; uniform float uTime;
+${TONEMAP}
+float hash(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32); return fract(p.x*p.y); }
+vec3 fetch(vec2 uv){
+  vec3 c = texture(uScene, uv).rgb;
+  if(uVolOn > 0.5){ vec4 v = texture(uVol, uv); c = c*(1.0 - v.a) + v.rgb; }
+  return toneMap(max(c, vec3(0.0)));
+}
+void main(){
+  // upscale from the render resolution, then contrast-adaptive sharpening restores edge detail
+  vec2 uv = vNdc*0.5 + 0.5;
+  vec3 c = fetch(uv);
+  vec3 n = fetch(uv + vec2(0.0, uTexel.y)), s = fetch(uv - vec2(0.0, uTexel.y));
+  vec3 e = fetch(uv + vec2(uTexel.x, 0.0)), w = fetch(uv - vec2(uTexel.x, 0.0));
+  vec3 mn = min(c, min(min(n,s), min(e,w))), mx = max(c, max(max(n,s), max(e,w)));
+  vec3 amp = sqrt(clamp(min(mn, 1.0 - mx)/max(mx, 1e-3), 0.0, 1.0));
+  vec3 k = -amp*uSharp*0.2;
+  vec3 r = (c + (n + s + e + w)*k)/(1.0 + 4.0*k);
+  r = clamp(r, 0.0, 1.0) + (hash(gl_FragCoord.xy + fract(uTime)*91.0) - 0.5)/255.0;
+  outColor = vec4(r, 1.0);
+}`;
+// float render targets enable the fast pipeline; without them the original ray-marched renderer runs
+const PIPE = !!gl.getExtension('EXT_color_buffer_float');
+const withDefs = (src, defs) => src.replace(/^#version 300 es\n/, '#version 300 es\n'+defs+'\n');
+const V = defs => SEA_FS.replace('__VARIANT__', defs);
 let seaLite=null, seaFull=null, objProg=null, partProg=null;
+let waveProg=null, skyLite=null, skyFull=null, meshLite=null, meshFull=null, volFull=null, finalProg=null, underProg=null, underState='none';
 let ready = false, failed = false, fullState = 'none';   // none | compiling | ready | failed
+let baseSet = [], fullSet = [];
 function startCompile(){
-  seaLite = compileStart(SEA_VS, SEA_FS.replace('__VARIANT__',''), 'sea');
-  objProg = compileStart(OBJ_VS, OBJ_FS, 'object');
-  partProg = compileStart(PART_VS, PART_FS, 'particle');
+  if(PIPE){
+    const H = '#define HDR_OUT';
+    waveProg = compileStart(SEA_VS, V('#define MODE_WAVE\n'+H), 'wave');
+    skyLite  = compileStart(SEA_VS, V('#define MODE_SKY\n'+H), 'sky');
+    meshLite = compileStart(MESH_VS, V('#define MODE_SEA\n'+H), 'sea-mesh');
+    finalProg = compileStart(SEA_VS, FINAL_FS, 'final');
+    objProg = compileStart(OBJ_VS, withDefs(OBJ_FS, H), 'object');
+    partProg = compileStart(PART_VS, withDefs(PART_FS, H), 'particle');
+    seaLite = meshLite;
+    baseSet = [waveProg, skyLite, meshLite, finalProg, objProg, partProg];
+  } else {
+    seaLite = compileStart(SEA_VS, V(''), 'sea');
+    objProg = compileStart(OBJ_VS, OBJ_FS, 'object');
+    partProg = compileStart(PART_VS, PART_FS, 'particle');
+    baseSet = [seaLite, objProg, partProg];
+  }
 }
 function compileFull(){
   if(fullState !== 'none') return;
   fullState = 'compiling'; syncQuality();
-  seaFull = compileStart(SEA_VS, SEA_FS.replace('__VARIANT__','#define FULL'), 'sea-full');
+  if(PIPE){
+    const H = '#define HDR_OUT\n#define FULL';
+    skyFull  = compileStart(SEA_VS, V('#define MODE_SKY\n'+H), 'sky-full');
+    meshFull = compileStart(MESH_VS, V('#define MODE_SEA\n'+H), 'sea-mesh-full');
+    volFull  = compileStart(SEA_VS, V('#define MODE_VOL\n'+H), 'volumetric');
+    fullSet = [skyFull, meshFull, volFull];
+  } else {
+    seaFull = compileStart(SEA_VS, V('#define FULL'), 'sea-full');
+    fullSet = [seaFull];
+  }
 }
 function checkFull(){
-  if(fullState !== 'compiling' || !programReady(seaFull)) return;
-  try{ programCheck(seaFull); fullState = 'ready'; }
+  if(fullState !== 'compiling' || !fullSet.every(programReady)) return;
+  try{ fullSet.forEach(programCheck); fullState = 'ready'; }
   catch(e){ fullState = 'failed'; console.warn('full shader', e.message); }
   hideLoading(); syncQuality();
+}
+// the underwater view keeps the original ray-marched shader; it is compiled the first time someone dives
+function underReady(){
+  if(underState === 'ready') return true;
+  if(underState === 'none'){ underState = 'compiling'; showLoading('正在載入水下視角', '第一次潛水需要幾秒編譯'); underProg = compileStart(SEA_VS, V('#define FULL\n#define HDR_OUT'), 'underwater'); }
+  if(underState === 'compiling' && programReady(underProg)){
+    try{ programCheck(underProg); underState = 'ready'; }catch(e){ underState = 'failed'; console.warn('underwater shader', e.message); }
+    hideLoading();
+  }
+  return underState === 'ready';
 }
 function hideLoading(){ const ld=document.getElementById('loading'); if(ld){ ld.hidden = true; ld.style.display='none'; } }
 function showLoading(t1, t2){ const ld=document.getElementById('loading'); if(!ld) return; ld.querySelector('b').textContent=t1; ld.querySelector('span').textContent=t2; ld.hidden=false; ld.style.display=''; }
@@ -1440,8 +1816,8 @@ function checkReady(){
   if(failed) return false;
   if(!seaLite) return false;
   if(!ready){
-    if(![seaLite,objProg,partProg].every(programReady)) return false;
-    try{ [seaLite,objProg,partProg].forEach(programCheck); }
+    if(!baseSet.every(programReady)) return false;
+    try{ baseSet.forEach(programCheck); }
     catch(err){ failed = true; fatal('著色器編譯失敗：'+err.message); console.error(err); return false; }
     ready = true; hideLoading(); last = performance.now(); setTimeout(loadAssets, 200);
     if(parallel) setTimeout(compileFull, 300);   // background: never blocks the page
@@ -1450,6 +1826,7 @@ function checkReady(){
   return true;
 }
 function seaProgram(){ return (S.quality > 0 && fullState === 'ready') ? seaFull : seaLite; }
+const useFull = () => S.quality > 0 && fullState === 'ready';
 // let the loading screen paint before the driver starts compiling
 setTimeout(startCompile, 30);
 canvas.addEventListener('webglcontextlost', e=>{
@@ -2123,26 +2500,33 @@ function updateEnv(dt){
 
 /* ================= Render ================= */
 let W=1,H=1;
+const dyn = {scale:1, acc:0, n:0, cool:0};   // dynamic resolution factor on top of the quality cap
 function resize(){
-  const q=QUALITY[S.quality]; const dpr=Math.min(window.devicePixelRatio||1, 1.25);
+  const q=QUALITY[S.quality];
+  if(PIPE){
+    const dpr=Math.min(window.devicePixelRatio||1, 1.5);
+    W=Math.max(1,Math.round(innerWidth*dpr)); H=Math.max(1,Math.round(innerHeight*dpr));
+    canvas.width=W; canvas.height=H;
+    return;
+  }
+  const dpr=Math.min(window.devicePixelRatio||1, 1.25);
   let sc=dpr*q.scale; const px=innerWidth*innerHeight*sc*sc; if(px>q.maxPx) sc*=Math.sqrt(q.maxPx/px);
   W=Math.max(1,Math.round(innerWidth*sc)); H=Math.max(1,Math.round(innerHeight*sc));
   canvas.width=W; canvas.height=H;
 }
 window.addEventListener('resize', resize); resize();
-const FOV = 55*Math.PI/180;
+const FOV = 55*Math.PI/180, NEAR = 0.5, FAR = 20000;
 
-function render(){
-  const tanH=Math.tan(FOV/2), aspect=W/H;
-  pixAng = 2*tanH/H;
-  const P=perspective(FOV, aspect, .5, 9000), V=viewFrom(cam.R, cam.eye), VP=mul4(P,V);
+let FR = null;   // per-frame camera/projection state
+function frameState(w, h){
+  const tanH=Math.tan(FOV/2), aspect=w/h;
+  pixAng = 2*tanH/h;
+  const P=perspective(FOV, aspect, NEAR, FAR), V=viewFrom(cam.R, cam.eye), VP=mul4(P,V);
   const R=cam.R, Rcol=new Float32Array([R[0],R[3],R[6], R[1],R[4],R[7], R[2],R[5],R[8]]);
-  gl.viewport(0,0,W,H);
-  gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
-  gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
-  // ---- sea + sky
-  const seaProg = seaProgram(); gl.useProgram(seaProg); const u=seaProg.u;
-  gl.depthFunc(gl.ALWAYS);
+  FR = {tanH, aspect, VP, Rcol, w, h};
+}
+function setCommon(prog){
+  const u=prog.u; const tanH=FR.tanH, aspect=FR.aspect, VP=FR.VP, Rcol=FR.Rcol;
   gl.uniform3fv(u('uCamPos'), cam.eye); gl.uniformMatrix3fv(u('uCamRot'), false, Rcol);
   gl.uniform1f(u('uTanH'), tanH); gl.uniform1f(u('uAspect'), aspect); gl.uniformMatrix4fv(u('uVP'), false, VP); gl.uniform1f(u('uPix'), pixAng);
   gl.uniform1f(u('uTime'), simTime); gl.uniform1i(u('uSteps'), QUALITY[S.quality].steps);
@@ -2179,7 +2563,9 @@ function render(){
       if(d && t){ on[i]=1; el[i]=d.el || d.span*320/2048; li[i]=d.lights?1:0; gl.uniform4f(u('uBg'+i), d.az, d.span, d.dist, 0); } }
     gl.uniform2fv(u('uBgOn'), on); gl.uniform2fv(u('uBgEl'), el); gl.uniform2fv(u('uBgLights'), li); }
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, moonTex.tex || dummyTex); gl.activeTexture(gl.TEXTURE0);
-  gl.bindVertexArray(triVao); gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+function drawObjects(){
+  const tanH=FR.tanH, VP=FR.VP, H=FR.h; const Wt=WATERS[S.water];
   // ---- floating objects
   gl.depthFunc(gl.LESS);
   gl.useProgram(objProg); const o=objProg.u;
@@ -2232,6 +2618,173 @@ function render(){
   if(boltLife>0 && boltCount>0 && !cam.under){ gl.blendFunc(gl.SRC_ALPHA, gl.ONE); gl.uniform1f(p('uRound'),0); gl.uniform1f(p('uFogD'), env.fogD*.3);
     gl.uniform4f(p('uColor'), 30,32,40, Math.random()>.3?1:.3); gl.bindVertexArray(boltG.vao); gl.drawArrays(gl.LINES,0,boltCount); }
   gl.depthMask(true); gl.disable(gl.BLEND); gl.bindVertexArray(null);
+}
+function renderLegacy(){
+  frameState(W, H);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0,0,W,H);
+  gl.disable(gl.BLEND); gl.enable(gl.DEPTH_TEST); gl.depthMask(true);
+  gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  const seaProg = seaProgram(); gl.useProgram(seaProg);
+  gl.depthFunc(gl.ALWAYS);
+  setCommon(seaProg);
+  gl.bindVertexArray(triVao); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  drawObjects();
+}
+
+/* ================= Fast pipeline: wave textures → env cache → scene (HDR) → half-res volumetrics → upscale + sharpen ================= */
+function makeTex(w, h, internal, format, type, filter){
+  const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,internal,w,h,0,format,type,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filter); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER, filter===gl.LINEAR_MIPMAP_LINEAR ? gl.LINEAR : filter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeTarget(w, h, opts){
+  const o = opts||{};
+  const tex = makeTex(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, o.mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+  if(o.wrapS) { gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, o.wrapS); }
+  const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  let depth = null;
+  if(o.depth){ depth = makeTex(w, h, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, gl.NEAREST); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0); }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return {tex, fb, depth, w, h};
+}
+function freeTarget(t){ if(!t) return; gl.deleteTexture(t.tex); if(t.depth) gl.deleteTexture(t.depth); gl.deleteFramebuffer(t.fb); }
+const RT = {scene:null, vol:null, near:null, far:null, env:null, q:-1, sw:0, sh:0, grid:null, gridQ:-1, envAge:99};
+function ensureTargets(){
+  const q = QUALITY[S.quality];
+  const sw = Math.max(64, Math.round(W*q.cap*dyn.scale)), sh = Math.max(64, Math.round(H*q.cap*dyn.scale));
+  if(!RT.scene || RT.sw !== sw || RT.sh !== sh){
+    freeTarget(RT.scene); freeTarget(RT.vol);
+    RT.scene = makeTarget(sw, sh, {depth:true});
+    RT.vol = makeTarget(Math.max(32, sw>>1), Math.max(32, sh>>1));
+    RT.sw = sw; RT.sh = sh;
+  }
+  if(RT.q !== S.quality){
+    freeTarget(RT.near); freeTarget(RT.far); freeTarget(RT.env);
+    RT.near = makeTarget(q.near, q.near, {mip:true});
+    RT.far  = makeTarget(q.far, q.far, {mip:true});
+    RT.env  = makeTarget(q.env[0], q.env[1], {wrapS: gl.REPEAT});
+    RT.q = S.quality; RT.envAge = 99;
+  }
+  if(RT.gridQ !== S.quality){
+    const [gx, gy] = q.grid; const v = new Float32Array((gx+1)*(gy+1)*2); let k=0;
+    for(let j=0;j<=gy;j++) for(let i=0;i<=gx;i++){ v[k++]=i/gx; v[k++]=j/gy; }
+    const idx = new Uint32Array(gx*gy*6); k=0;
+    for(let j=0;j<gy;j++) for(let i=0;i<gx;i++){ const a=j*(gx+1)+i, b=a+1, c=a+gx+1, d=c+1; idx[k++]=a; idx[k++]=b; idx[k++]=c; idx[k++]=b; idx[k++]=d; idx[k++]=c; }
+    if(RT.grid){ gl.deleteVertexArray(RT.grid.vao); }
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, v, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+    const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+    RT.grid = {vao, count: idx.length}; RT.gridQ = S.quality;
+  }
+}
+const NEAR_SIZE = 256, FAR_SIZE = 3200;
+function levelOf(rt, size){
+  const texel = size/rt.w;
+  const cx = Math.floor(cam.eye[0]/texel)*texel, cz = Math.floor(cam.eye[2]/texel)*texel;   // snapped: no shimmer as the camera moves
+  return [cx, cz, size, texel];
+}
+function drawFull(){ gl.bindVertexArray(triVao); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+function horizonTop(){
+  // NDC height of the horizon on screen, so the sea grid spends no vertices on the sky
+  const R = cam.R, th = FR.tanH, as = FR.aspect;
+  if(R[4] <= 0.05) return 1.05;
+  let y = -2;
+  for(const x of [-1.15, 1.15]) y = Math.max(y, (R[5] - R[3]*x*th*as)/(R[4]*th));
+  return clamp(y + 0.04, -1.2, 1.05);
+}
+function render(){
+  if(!PIPE){ renderLegacy(); return; }
+  if(cam.under && !underReady()){ return; }
+  ensureTargets();
+  const q = QUALITY[S.quality], full = useFull();
+  frameState(RT.sw, RT.sh);
+  gl.disable(gl.BLEND);
+  // 1) wave height + slope textures around the camera (near: fine detail, far: swell out to 1.6 km)
+  const nearL = levelOf(RT.near, NEAR_SIZE), farL = levelOf(RT.far, FAR_SIZE);
+  if(!cam.under){
+    gl.useProgram(waveProg); setCommon(waveProg); const u = waveProg.u;
+    gl.disable(gl.DEPTH_TEST); gl.uniform1f(u('uPix'), 1.0); gl.uniform1i(u('uDN'), 24); gl.uniform1f(u('uExtraOn'), 1);
+    for(const [rt, L] of [[RT.near, nearL], [RT.far, farL]]){
+      gl.bindFramebuffer(gl.FRAMEBUFFER, rt.fb); gl.viewport(0,0,rt.w,rt.h);
+      gl.uniform4f(u('uLevel'), L[0], L[1], L[2], L[3]*0.36); gl.uniform2f(u('uLevelRes'), rt.w, rt.h);
+      drawFull();
+      gl.bindTexture(gl.TEXTURE_2D, rt.tex); gl.generateMipmap(gl.TEXTURE_2D);
+    }
+    // 2) reflection environment (sky + far scenery), refreshed every few frames
+    const sky = full ? skyFull : skyLite;
+    if(++RT.envAge >= 4){
+      RT.envAge = 0;
+      gl.useProgram(sky); setCommon(sky);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, RT.env.fb); gl.viewport(0,0,RT.env.w,RT.env.h);
+      gl.uniform1f(sky.u('uEnvMode'), 1); gl.uniform2f(sky.u('uEnvRes'), RT.env.w, RT.env.h);
+      drawFull();
+    }
+  }
+  // 3) scene at render resolution, in HDR
+  gl.bindFramebuffer(gl.FRAMEBUFFER, RT.scene.fb); gl.viewport(0,0,RT.sw,RT.sh);
+  gl.enable(gl.DEPTH_TEST); gl.depthMask(true); gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  if(cam.under){
+    gl.useProgram(underProg); setCommon(underProg); gl.depthFunc(gl.ALWAYS); drawFull();
+  } else {
+    const sky = full ? skyFull : skyLite;
+    gl.useProgram(sky); setCommon(sky); gl.uniform1f(sky.u('uEnvMode'), 0);
+    gl.depthFunc(gl.ALWAYS); drawFull();
+    const mesh = full ? meshFull : meshLite; const m = mesh.u;
+    gl.useProgram(mesh); setCommon(mesh);
+    gl.uniform1f(m('uYTop'), horizonTop());
+    gl.uniform4fv(m('uNearL'), nearL); gl.uniform4fv(m('uFarL'), farL);
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, RT.near.tex); gl.uniform1i(m('uNearTex'), 4);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, RT.far.tex);  gl.uniform1i(m('uFarTex'), 5);
+    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, RT.env.tex);  gl.uniform1i(m('uEnvTex'), 6);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.depthFunc(gl.LESS);
+    gl.bindVertexArray(RT.grid.vao); gl.drawElements(gl.TRIANGLES, RT.grid.count, gl.UNSIGNED_INT, 0);
+  }
+  gl.depthFunc(gl.LESS);
+  drawObjects();
+  gl.disable(gl.BLEND); gl.depthMask(true);
+  // 4) volumetrics at half resolution: god rays, waterspout, tsunami mist, lighthouse beam
+  const volOn = full && !cam.under && volFull;
+  if(volOn){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, RT.vol.fb); gl.viewport(0,0,RT.vol.w,RT.vol.h); gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(volFull); setCommon(volFull);
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, RT.scene.depth); gl.uniform1i(volFull.u('uDepthTex'), 4);
+    gl.activeTexture(gl.TEXTURE0); gl.uniform2f(volFull.u('uNF'), NEAR, FAR);
+    drawFull();
+  }
+  // 5) upscale to the display, sharpen, tone map
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0,0,W,H); gl.disable(gl.DEPTH_TEST);
+  gl.useProgram(finalProg); const f = finalProg.u;
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, RT.scene.tex); gl.uniform1i(f('uScene'), 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, volOn ? RT.vol.tex : dummyTex); gl.uniform1i(f('uVol'), 1); gl.activeTexture(gl.TEXTURE0);
+  gl.uniform1f(f('uVolOn'), volOn ? 1 : 0);
+  gl.uniform2f(f('uTexel'), 1/RT.sw, 1/RT.sh);
+  const ratio = RT.sw/W; gl.uniform1f(f('uSharp'), clamp(0.35 + (1 - ratio)*1.1, 0.35, 1.0));
+  gl.uniform1f(f('uExposure'), C.exposure); gl.uniform1f(f('uTime'), simTime);
+  drawFull();
+  // unbind render targets from texture units so the next frame never samples what it is drawing into
+  for(const unit of [0,1,4,5,6]){ gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D, dummyTex); }
+  gl.activeTexture(gl.TEXTURE0);
+  gl.enable(gl.DEPTH_TEST);
+}
+// dynamic resolution: keep ~60 fps by trimming the render scale, sharpening hides the difference
+function updateDyn(raw){
+  if(!PIPE || !ready) return;
+  dyn.acc += raw; dyn.n++;
+  if(dyn.n < 24) return;
+  const avg = dyn.acc/dyn.n; dyn.acc = 0; dyn.n = 0;
+  if(dyn.cool > 0){ dyn.cool--; return; }
+  let s = dyn.scale;
+  if(avg > 1/50) s = Math.max(0.6, s - 0.08);
+  else if(avg < 1/57) s = Math.min(1, s + 0.05);
+  s = Math.round(s*20)/20;
+  if(s !== dyn.scale){ dyn.scale = s; dyn.cool = 2; syncQuality(); }
 }
 
 /* ================= HUD ================= */
@@ -2397,6 +2950,7 @@ $('#show-ui').addEventListener('click',()=>setClean(false));
 window.addEventListener('keydown',e=>{ if((e.key==='h'||e.key==='H') && !e.target.closest('input,textarea')) setClean(!document.body.classList.contains('clean')); });
 function syncQuality(){ const el=$('#qual'); if(!el) return; let t='畫質 '+QUALITY[S.quality].name;
   if(S.quality>0 && fullState==='compiling') t+='（完整效果載入中）'; else if(S.quality>0 && fullState==='failed') t+='（精簡）'; else if(S.quality===0) t+='（精簡）';
+  if(PIPE && ready) t += ' · '+Math.round(QUALITY[S.quality].cap*dyn.scale*100)+'%';
   el.textContent=t; }
 $('#qual').addEventListener('click',()=>{ S.quality=(S.quality+1)%3; autoQ.done=true;
   if(S.quality>0 && fullState==='none'){ showLoading('正在載入完整效果','地景、極光、日暈、丁達爾光與水下視角，第一次需要一點時間'); setTimeout(compileFull, 60); }
@@ -2431,6 +2985,7 @@ function frame(now){
   updatePrecip(dt, cam.under?0:env.rainAmt, cam.under?0:env.snowAmt); updateSpout(dt); updateSpray(dt, cam.under?0:env.ph.spray); updateMarine(dt);
   if(audio && soundOn) audio.update(env.rainAmt);
   render();
+  updateDyn(raw);
   hudT-=dt; if(hudT<=0){ hudT=.2; updateHUD(); updateAlerts(); }
   if(!autoQ.done){ autoQ.t+=raw; if(autoQ.t>.8){ autoQ.n++; autoQ.sum+=raw; }
     if(autoQ.n>=45){ const avg=autoQ.sum/autoQ.n;
@@ -2441,7 +2996,7 @@ function frame(now){
       autoQ.n=0; autoQ.sum=0; autoQ.t=0; } }
   requestAnimationFrame(frame);
 }
-window.__ocean = {S, C, D, cam, env, autoQ, resize, aur, startTsunami, startQuake, set(k,v){ S[k]=v; syncSlider(k); }, snap(){ for(const k of ['wind','cloud','precip','fog','thunder','temp','waveScale','chop','foam','clarity']) C[k]=S[k]; const Wt=WATERS[S.water]; C.fetch=Wt.fetch; C.deep=Wt.deep.slice(); C.shallow=Wt.shallow.slice(); const a=S.windDir*Math.PI/180; C.wx=Math.sin(a); C.wz=-Math.cos(a); for(let i=0;i<300;i++) updateWaves(.05); }};
+window.__ocean = {S, C, D, cam, env, autoQ, resize, aur, dyn, RT, PIPE, gl, get under(){ return [underState, underProg && gl.getProgramInfoLog(underProg)]; }, startTsunami, startQuake, set(k,v){ S[k]=v; syncSlider(k); }, snap(){ for(const k of ['wind','cloud','precip','fog','thunder','temp','waveScale','chop','foam','clarity']) C[k]=S[k]; const Wt=WATERS[S.water]; C.fetch=Wt.fetch; C.deep=Wt.deep.slice(); C.shallow=Wt.shallow.slice(); const a=S.windDir*Math.PI/180; C.wx=Math.sin(a); C.wz=-Math.cos(a); for(let i=0;i<300;i++) updateWaves(.05); }};
 window.__ocean.snap();
 requestAnimationFrame(frame);
 })();
